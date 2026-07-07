@@ -1,0 +1,1206 @@
+openapi: 3.0.3
+
+info:
+  title: InPost Mobile API (unofficial)
+  version: "1.0.0"
+  description: |
+    **Unofficial** spec for private InPost parcel flows. This project was built
+    on publicly available information and data. There is no public contract, no
+    SLA, and InPost may change or block this at any time.
+
+    This spec focuses on the **core consumer flows**: authentication, inbound
+    (tracked) parcels and their status/QR, opening a Paczkomat compartment
+    remotely, and finding pickup points. Loyalty / shopping ("izi") / Nimbus
+    endpoints exist but are out of scope here — see `API_REFERENCE.md` Appendix A.
+
+    ### Things that bite you (read before coding)
+    - **Path resolution is mixed.** Some endpoint groups use `/global`, while
+      others work from the host root. Standard clients drop `/global` for
+      leading-slash paths. This spec keeps `/global` as the default server for
+      unresolved endpoint groups and adds path-level root servers where the root
+      path has been observed working.
+    - **A parcel carries TWO codes:** `openCode` (numeric keypad / remote-open
+      code) and `qrCode` (opaque string to render as a QR for the locker's
+      scanner). They are different fields and not derivable from each other.
+    - **Remote open is GPS-gated but the GPS is client-supplied** — proximity is
+      effectively a client-side guardrail, not a hard server gate.
+    - **Legacy SMS phone numbers include `+`:** `{prefix:"+48", value:"..."}`.
+    - **Dates are ISO-8601 offset** (`2024-06-30T14:30:00.000+02:00`).
+    - **Minimal headers work:** only `Authorization: Bearer` + `Content-Type`/
+      `Accept: application/json` are required. Common device headers
+      (`Device-ID`, `device-uid`, `Session-ID`, `X-App-Id`, `Accept-Language`)
+      are NOT server-enforced.
+    - **`/v4/parcels/tracked` has no query params** and is server-stateful
+      paginated: re-call while `more == true`.
+  contact:
+    name: See API_REFERENCE.md and README.md in this folder
+  license:
+    name: Unofficial interoperability documentation; not affiliated with InPost.
+
+servers:
+  - url: https://api-inmobile-pl.easypack24.net/global
+    description: Production
+  - url: https://test-api-inmobile-pl.easypack24.net/global
+    description: Test/mock
+
+tags:
+  - name: Authentication
+    description: SMS-based login (recommended for non-app clients) and token refresh/logout.
+  - name: Parcels (inbound)
+    description: Tracked/inbound parcels — list, detail, add/remove tracking, share.
+  - name: Parcels (sent)
+    description: Outbound parcels created by the user.
+  - name: Compartment (Collect)
+    description: Remote open of a Paczkomat compartment to collect a parcel.
+  - name: Points
+    description: Paczkomaty and other pickup/drop-off points.
+  - name: Notifications
+    description: In-app notification centre.
+  - name: Account
+    description: Account deletion.
+
+security:
+  - bearerAuth: []
+
+paths:
+
+  # ----------------------------------------------------------------------------
+  # AUTHENTICATION
+  # ----------------------------------------------------------------------------
+
+  /v1/account:
+    servers:
+      - url: https://api-inmobile-pl.easypack24.net
+        description: Production host root; observed working for SMS auth.
+      - url: https://test-api-inmobile-pl.easypack24.net
+        description: Test/mock host root.
+    post:
+      operationId: sendSmsCode
+      tags: [Authentication]
+      summary: Request an SMS login code
+      description: |
+        Step 1 of the SMS login flow. Triggers an SMS containing a one-time code
+        to the given phone number. No auth required.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SendSMSCodeRequest' }
+      responses:
+        '200':
+          description: SMS dispatched.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SendSMSCodeResponse' }
+        '400': { $ref: '#/components/responses/Error' }
+    delete:
+      operationId: deleteAccount
+      tags: [Account]
+      summary: Delete the user account
+      responses:
+        '200': { description: Account deleted. }
+        '401': { $ref: '#/components/responses/Error' }
+
+  /v1/account/verification:
+    servers:
+      - url: https://api-inmobile-pl.easypack24.net
+        description: Production host root; observed working for SMS auth.
+      - url: https://test-api-inmobile-pl.easypack24.net
+        description: Test/mock host root.
+    post:
+      operationId: confirmSmsCode
+      tags: [Authentication]
+      summary: Confirm SMS code and obtain tokens
+      description: |
+        Step 2 of the SMS login flow. Exchanges the phone number + SMS code for
+        an access token (`authToken`) and a `refreshToken`. No auth required.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConfirmSMSRequest' }
+      responses:
+        '200':
+          description: Authenticated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfirmSMSResponse' }
+        '400': { $ref: '#/components/responses/Error' }
+
+  /v1/authenticate:
+    servers:
+      - url: https://api-inmobile-pl.easypack24.net
+        description: Production host root; observed working for SMS auth refresh.
+      - url: https://test-api-inmobile-pl.easypack24.net
+        description: Test/mock host root.
+    post:
+      operationId: refreshToken
+      tags: [Authentication]
+      summary: Refresh the access token
+      description: |
+        Mints a new access token from a stored `refreshToken`. No bearer auth
+        required (the refresh token is the credential).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AuthenticateRequest' }
+      responses:
+        '200':
+          description: New token issued.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthenticationResponse' }
+        '401': { $ref: '#/components/responses/Error' }
+
+  /v1/sendSMSCode:
+    get:
+      operationId: resendSmsCode
+      tags: [Authentication]
+      summary: Resend SMS code (re-confirmation flow)
+      responses:
+        '200':
+          description: SMS dispatched.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SendSMSCodeResponse' }
+
+  /v1/reconfirmSMSCode:
+    post:
+      operationId: reconfirmSmsCode
+      tags: [Authentication]
+      summary: Re-confirm SMS code using a refresh token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReconfirmSMSRequest' }
+      responses:
+        '200':
+          description: Confirmed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfirmSMSResponse' }
+
+  /v1/logout:
+    post:
+      operationId: logout
+      tags: [Authentication]
+      summary: Log out current session
+      responses:
+        '200': { description: Logged out. }
+
+  /v1/logout-all:
+    post:
+      operationId: logoutAll
+      tags: [Authentication]
+      summary: Log out all sessions
+      responses:
+        '200': { description: All sessions revoked. }
+
+  # ----------------------------------------------------------------------------
+  # PARCELS (INBOUND / TRACKED)
+  # ----------------------------------------------------------------------------
+
+  /v4/parcels/tracked:
+    servers:
+      - url: https://api-inmobile-pl.easypack24.net
+        description: Production host root; observed working for tracked parcels.
+      - url: https://test-api-inmobile-pl.easypack24.net
+        description: Test/mock host root.
+    get:
+      operationId: listTrackedParcels
+      tags: [Parcels (inbound)]
+      summary: List inbound/tracked parcels
+      description: |
+        Returns ALL tracked parcels for the authenticated user. **No query
+        parameters.** Server-stateful pagination: if `more == true`, call again
+        (no cursor) and accumulate `parcels[]` until `more == false`.
+        `removedParcelList[]` lists shipment numbers to drop locally.
+      responses:
+        '200':
+          description: Parcel list.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TrackedParcelsResponse' }
+        '401': { $ref: '#/components/responses/Error' }
+
+  /v4/parcels/tracked/{shipmentNumber}:
+    servers:
+      - url: https://api-inmobile-pl.easypack24.net
+        description: Production host root; observed working for tracked parcels.
+      - url: https://test-api-inmobile-pl.easypack24.net
+        description: Test/mock host root.
+    get:
+      operationId: getTrackedParcel
+      tags: [Parcels (inbound)]
+      summary: Get a single tracked parcel
+      parameters:
+        - $ref: '#/components/parameters/ShipmentNumberPath'
+        - name: notification-id
+          in: header
+          required: false
+          description: Optional; set when opening from a push notification.
+          schema: { type: string }
+      responses:
+        '200':
+          description: Parcel detail.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TrackedParcelNetwork' }
+        '401': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /v4/parcels/multi/{multiCompartmentUuid}:
+    get:
+      operationId: getMultiCompartmentParcels
+      tags: [Parcels (inbound)]
+      summary: Get all parcels in a multi-compartment delivery
+      parameters:
+        - name: multiCompartmentUuid
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Parcels in the multi-compartment group.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TrackedParcelsResponse' }
+
+  /v4/parcels/observed:
+    post:
+      operationId: addTrackedParcel
+      tags: [Parcels (inbound)]
+      summary: Start tracking a parcel by number
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AddTrackedParcelRequest' }
+      responses:
+        '200':
+          description: Now tracked.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TrackedObservedParcelResponse' }
+        '400': { $ref: '#/components/responses/Error' }
+
+  /v4/parcels/observed/{shipmentNumber}:
+    delete:
+      operationId: removeTrackedParcel
+      tags: [Parcels (inbound)]
+      summary: Stop tracking / remove a parcel
+      parameters:
+        - $ref: '#/components/parameters/ShipmentNumberPath'
+      responses:
+        '200': { description: Removed. }
+
+  /v4/parcels/properties:
+    post:
+      operationId: setParcelProperty
+      tags: [Parcels (inbound)]
+      summary: Set a parcel property
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ParcelPropertiesRequest' }
+      responses:
+        '200': { description: Property set. }
+
+  /v4/parcels/shared:
+    post:
+      operationId: shareParcels
+      tags: [Parcels (inbound)]
+      summary: Share parcel(s) with friends
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ShareParcelsRequest' }
+      responses:
+        '200': { description: Shared. }
+
+  /v4/parcels/sent:
+    get:
+      operationId: listSentParcels
+      tags: [Parcels (sent)]
+      summary: List sent parcels
+      responses:
+        '200':
+          description: Sent parcels.
+          content:
+            application/json:
+              schema:
+                type: object
+                description: SentParcelsResponse (shape analogous to TrackedParcelsResponse).
+                additionalProperties: true
+
+  /v4/parcels/sent/{shipmentNumber}:
+    get:
+      operationId: getSentParcel
+      tags: [Parcels (sent)]
+      summary: Get a single sent parcel
+      parameters:
+        - $ref: '#/components/parameters/ShipmentNumberPath'
+      responses:
+        '200':
+          description: Sent parcel detail.
+          content:
+            application/json:
+              schema:
+                type: object
+                description: SentParcelV4Network.
+                additionalProperties: true
+
+  # ----------------------------------------------------------------------------
+  # COMPARTMENT (REMOTE COLLECT)
+  # ----------------------------------------------------------------------------
+
+  /v2/collect/validate:
+    post:
+      operationId: collectValidate
+      tags: [Compartment (Collect)]
+      summary: "Collect step 1: validate + open a session"
+      description: |
+        Validates the parcel + your GPS position and opens a collect session.
+        The returned `sessionUuid` is the key for every subsequent step.
+        Rejected (compartment error) if the server's geofence is not satisfied.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CompartmentValidationRequest' }
+      responses:
+        '200':
+          description: Session opened.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CompartmentValidateResponse' }
+        '400': { $ref: '#/components/responses/Error' }
+
+  /v1/collect/compartment/open:
+    post:
+      operationId: collectOpenCompartment
+      tags: [Compartment (Collect)]
+      summary: "Collect step 2: open the compartment"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CompartmentSessionIdRequest' }
+      responses:
+        '200':
+          description: Compartment opening.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CompartmentOpenResponse' }
+        '400': { $ref: '#/components/responses/Error' }
+
+  /v1/collect/compartment/reopen:
+    post:
+      operationId: collectReopenCompartment
+      tags: [Compartment (Collect)]
+      summary: Reopen the compartment
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CompartmentSessionIdRequest' }
+      responses:
+        '200':
+          description: Compartment reopening.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CompartmentOpenResponse' }
+
+  /v1/collect/compartment/status:
+    post:
+      operationId: collectCompartmentStatus
+      tags: [Compartment (Collect)]
+      summary: "Collect step 3: poll compartment status"
+      description: |
+        Poll until the compartment reaches the expected state. Set
+        `expectedStatus=OPENED` after opening, then `expectedStatus=CLOSED`
+        after the user shuts the door.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CompartmentStatusRequest' }
+      responses:
+        '200':
+          description: Current status.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CompartmentStatusResponse' }
+
+  /v1/collect/compartment/closed:
+    post:
+      operationId: collectConfirmClosed
+      tags: [Compartment (Collect)]
+      summary: "Collect step 4: confirm door closed"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CompartmentSessionIdRequest' }
+      responses:
+        '200':
+          description: Close confirmation.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CompartmentCloseResponse' }
+
+  /v1/collect/compartment/claim:
+    post:
+      operationId: collectClaim
+      tags: [Compartment (Collect)]
+      summary: "Collect step 5: claim collected parcels"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CompartmentClaimRequest' }
+      responses:
+        '200':
+          description: Claimed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CompartmentClaimResponse' }
+
+  /v1/collect/terminate:
+    post:
+      operationId: collectTerminate
+      tags: [Compartment (Collect)]
+      summary: Terminate / cancel the collect session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CompartmentSessionIdRequest' }
+      responses:
+        '200': { description: Session terminated. }
+
+  # ----------------------------------------------------------------------------
+  # POINTS
+  # ----------------------------------------------------------------------------
+
+  /v4/points:
+    get:
+      operationId: findPoints
+      tags: [Points]
+      summary: Find pickup/drop-off points
+      description: |
+        Two usage modes:
+        - by location: `relativePoint=<lat,lng>` + `maxDistance`
+        - by text: `query=<text>` + `relativePostCode` + `perPage`
+        Always pass `filter` (comma-separated capability tokens, e.g.
+        `parcel_send`); empty/broad filter returns all types.
+      parameters:
+        - name: relativePoint
+          in: query
+          description: "`<lat,lng>` for proximity search."
+          schema: { type: string, example: "52.2297,21.0122" }
+        - name: maxDistance
+          in: query
+          description: Max distance in meters (with relativePoint).
+          schema: { type: number, format: double }
+        - name: query
+          in: query
+          description: Free-text search (alternative to relativePoint).
+          schema: { type: string }
+        - name: relativePostCode
+          in: query
+          schema: { type: string }
+        - name: filter
+          in: query
+          required: true
+          description: Comma-separated capability tokens (e.g. `parcel_send`).
+          schema: { type: string }
+        - name: country
+          in: query
+          schema: { type: string, example: "PL" }
+        - name: perPage
+          in: query
+          description: Page size for text search (default 100).
+          schema: { type: integer, default: 100 }
+      responses:
+        '200':
+          description: Points.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PointsV4Network' }
+
+  /v4/points/{boxMachineName}:
+    get:
+      operationId: getPoint
+      tags: [Points]
+      summary: Get a single point by name
+      parameters:
+        - name: boxMachineName
+          in: path
+          required: true
+          description: Point/machine name, e.g. `KRA01M`.
+          schema: { type: string }
+      responses:
+        '200':
+          description: Point detail.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PointV4Network' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  # ----------------------------------------------------------------------------
+  # NOTIFICATIONS
+  # ----------------------------------------------------------------------------
+
+  /v3/notifications:
+    get:
+      operationId: listNotifications
+      tags: [Notifications]
+      summary: List notifications
+      parameters:
+        - name: type
+          in: query
+          required: true
+          description: Notification type filter (comma-separated).
+          schema: { type: string }
+      responses:
+        '200':
+          description: Notifications.
+          content:
+            application/json:
+              schema:
+                type: object
+                description: NotificationV3Response.
+                additionalProperties: true
+
+  /v1/notifications/read:
+    post:
+      operationId: markNotificationsRead
+      tags: [Notifications]
+      summary: Mark specific notifications as read
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: MarkMultipleAsReadRequest.
+              additionalProperties: true
+      responses:
+        '200': { description: Marked. }
+
+  /v1/notifications/readAll:
+    post:
+      operationId: markAllNotificationsRead
+      tags: [Notifications]
+      summary: Mark all notifications as read
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: MarkAllAsReadRequest.
+              additionalProperties: true
+      responses:
+        '200': { description: Marked. }
+
+# ==============================================================================
+# COMPONENTS
+# ==============================================================================
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        `Authorization: Bearer <accessToken>`. Obtain via the SMS flow
+        (`/v1/account` → `/v1/account/verification`) or the OAuth PKCE flow
+        (out of scope here; see README/API_REFERENCE). Refresh via
+        `/v1/authenticate`. On HTTP 401, refresh and retry.
+
+  parameters:
+    ShipmentNumberPath:
+      name: shipmentNumber
+      in: path
+      required: true
+      description: Parcel tracking number.
+      schema: { type: string }
+
+  responses:
+    Error:
+      description: Error envelope.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  schemas:
+
+    # ---- shared ----
+    InternationalPhoneNumberNetwork:
+      type: object
+      description: Phone number. Legacy SMS login uses a prefix with a leading `+`.
+      required: [prefix, value]
+      properties:
+        prefix: { type: string, example: "+48", description: "Country prefix, including `+` for legacy SMS login." }
+        value: { type: string, example: "600123456" }
+
+    ErrorResponse:
+      type: object
+      description: |
+        Standard error envelope. `error` is the machine-readable camelCase code.
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: |
+            Machine-readable code. Common values:
+            `serverError`, `serviceCutOff`, `internalCommunicationError`;
+            locker: `invalidSession`, `sessionExpired`, `invalidSessionState`,
+            `sessionAlreadyExists`, `cannotFindCompartment`,
+            `invalidCompartmentState`, `invalidParcelState`, `boxMachineNotFound`,
+            `invalidBoxMachineConfiguration`.
+          example: sessionExpired
+        description: { type: string, nullable: true }
+        status: { type: integer, nullable: true, description: Echoed HTTP status. }
+        message: { type: string, nullable: true }
+        diagnosticId: { type: string, nullable: true, description: Quote when contacting InPost. }
+        details:
+          allOf: [{ $ref: '#/components/schemas/ApiErrorDetails' }]
+
+    ApiErrorDetails:
+      type: object
+      properties:
+        appKeys: { type: array, nullable: true, items: { type: object, additionalProperties: true } }
+        deliveryPointName: { type: string, nullable: true }
+        redirectUrl: { type: string, nullable: true }
+
+    # ---- auth ----
+    SendSMSCodeRequest:
+      type: object
+      required: [phoneNumber]
+      properties:
+        phoneNumber: { $ref: '#/components/schemas/InternationalPhoneNumberNetwork' }
+
+    SendSMSCodeResponse:
+      type: object
+      description: |
+        Some backend versions return this object; others return an empty 2xx
+        body. Clients should treat any 2xx response from `sendSmsCode` as
+        success and should not require this body.
+      properties:
+        expirationTime: { type: string, format: date-time, nullable: true, description: When the SMS code expires, if returned. }
+
+    ConfirmSMSRequest:
+      type: object
+      required: [phoneNumber, smsCode, devicePlatform]
+      properties:
+        phoneNumber: { $ref: '#/components/schemas/InternationalPhoneNumberNetwork' }
+        smsCode: { type: string, example: "1234" }
+        devicePlatform:
+          type: string
+          description: "Kotlin field `phoneOS`; send `Android`."
+          example: Android
+
+    ConfirmSMSResponse:
+      type: object
+      required: [authToken, refreshToken]
+      properties:
+        authToken: { type: string, description: Access token (use as Bearer). }
+        refreshToken: { type: string }
+
+    AuthenticateRequest:
+      type: object
+      required: [refreshToken, phoneOS]
+      properties:
+        refreshToken: { type: string }
+        phoneOS: { type: string, example: Android }
+
+    AuthenticationResponse:
+      type: object
+      required: [authToken]
+      properties:
+        authToken: { type: string }
+        reauthenticationRequired: { type: boolean, nullable: true }
+        refreshTokenExpiryDate: { type: string, format: date-time, nullable: true }
+        pushIdStatus: { type: string, nullable: true, description: "Kotlin field `pushTokenStatus`." }
+
+    ReconfirmSMSRequest:
+      type: object
+      required: [refreshToken, smsCode]
+      properties:
+        refreshToken: { type: string }
+        smsCode: { type: string }
+
+    # ---- parcels ----
+    TrackedParcelsResponse:
+      type: object
+      required: [parcels, more]
+      properties:
+        parcels:
+          type: array
+          items: { $ref: '#/components/schemas/TrackedParcelNetwork' }
+        removedParcelList:
+          type: array
+          nullable: true
+          description: Shipment numbers no longer tracked — delete locally.
+          items: { type: string }
+        updatedUntil: { type: string, format: date-time, nullable: true, description: Returned by the API; not sufficient for delta sync. }
+        more: { type: boolean, description: "If true, call again to fetch the rest." }
+
+    TrackedObservedParcelResponse:
+      type: object
+      required: [trackedParcel]
+      properties:
+        trackedParcel: { $ref: '#/components/schemas/TrackedParcelNetwork' }
+
+    TrackedParcelNetwork:
+      type: object
+      required: [shipmentNumber, shipmentType, status, statusGroup, events, eventLog, operations, sharedTo, ownershipStatus]
+      properties:
+        shipmentNumber: { type: string }
+        shipmentType: { type: string }
+        status:
+          type: string
+          description: |
+            Detailed status (free-form string). Examples: `created`, `confirmed`,
+            `out_for_delivery`, `ready_to_pickup`, `stack_in_box_machine`,
+            `pickup_reminder_sent`, `delivered`, `pickup_time_expired`,
+            `returned_to_sender`, `avizo`, `claimed`, `oversized`,
+            `undelivered`. See API_REFERENCE.md §5.4 for the full set.
+        statusGroup:
+          type: string
+          description: >
+            Coarse bucket, UPPERCASE on the wire — examples include `DELIVERED`, `CLAIMED`;
+            also `READY`, `IN_DELIVERY`, `CREATED`, `OTHER`. Match case-insensitively.
+        events:
+          type: array
+          items: { $ref: '#/components/schemas/EventNetwork' }
+        eventLog:
+          type: array
+          items: { $ref: '#/components/schemas/EventLogNetwork' }
+        openCode:
+          type: string
+          nullable: true
+          description: Numeric pickup/open code (keypad + remote-open).
+        qrCode:
+          type: string
+          nullable: true
+          description: Opaque QR payload — render verbatim as a QR for the locker scanner. NOT the openCode.
+        expiryDate: { type: string, format: date-time, nullable: true }
+        storedDate: { type: string, format: date-time, nullable: true }
+        pickUpDate: { type: string, format: date-time, nullable: true, description: "Collection time; present on finished parcels — the reliable completed-on timestamp (see API_REFERENCE.md §5.3d)." }
+        returnedToSenderDate: { type: string, format: date-time, nullable: true }
+        parcelSize:
+          type: string
+          nullable: true
+          description: >
+            Gabaryt/size code. Usually a single letter A–J, but the literal
+            `OTHER` can also occur on the wire. Maps to XS/S/M/L, else no badge — see
+            API_REFERENCE.md §5.3b.
+        receiver:
+          nullable: true
+          allOf: [{ $ref: '#/components/schemas/InternationalCustomerNetwork' }]
+        sender:
+          nullable: true
+          allOf: [{ $ref: '#/components/schemas/InternationalCustomerNetwork' }]
+          description: >
+            Sending customer. `sender.name` carries the merchant/sender display
+            name (company or person, e.g. "Amazon Polska") and is populated on
+            the list endpoint too, so it can title a list/history row without a
+            per-parcel detail fetch.
+        pickUpPoint:
+          allOf: [{ $ref: '#/components/schemas/BoxMachineNetwork' }]
+        cod:
+          allOf: [{ $ref: '#/components/schemas/CashOnDeliveryNetwork' }]
+        multiCompartment:
+          allOf: [{ $ref: '#/components/schemas/MultiCompartmentNetwork' }]
+        mobileCollectPossible: { type: boolean, nullable: true, deprecated: true, description: "Legacy v1 field. NOT returned by v4 /parcels/tracked — do not rely on it. Use operations.collect to decide if remote open is offered." }
+        endOfWeekCollection: { type: boolean }
+        internationalParcel: { type: boolean, nullable: true }
+        operations: { $ref: '#/components/schemas/TrackedParcelOperationsNetwork' }
+        avizoTransactionStatus: { type: string, nullable: true }
+        courierPhoneNumber:
+          allOf: [{ $ref: '#/components/schemas/InternationalPhoneNumberNetwork' }]
+        inEasyAccessZone: { type: boolean, nullable: true }
+        sharedTo:
+          type: array
+          description: >
+            Outbound: friends you shared this parcel with (usually empty).
+            Distinct from ownershipStatus. Each item is a FriendNetwork:
+            { uuid, name, phoneNumber{prefix,value} }.
+          items:
+            type: object
+            additionalProperties: true
+            properties:
+              uuid: { type: string }
+              name: { type: string }
+              phoneNumber:
+                type: object
+                properties:
+                  prefix: { type: string }
+                  value: { type: string }
+        ownershipStatus:
+          type: string
+          description: >
+            Your relationship to the parcel. Live values: `OWN` (you own it) and
+            `FRIEND` (shared with you) — NOT "OWNER"/"OWNED". Treat non-`OWN` (e.g.
+            `FRIEND`) as shared-with-me. Distinct from `sharedTo` (outbound). See
+            API_REFERENCE.md §5.3d.
+        economyParcel: { type: boolean, description: "Kotlin field `isEconomy`." }
+        carbonFootprint: { nullable: true, type: object, additionalProperties: true, description: CarbonFootprintNetwork. }
+
+    TrackedParcelOperationsNetwork:
+      type: object
+      description: Capability flags driving the UI.
+      required: [requestEasyAccessZone]
+      properties:
+        manualArchive: { type: boolean }
+        autoArchivableSince: { type: string, format: date-time, nullable: true }
+        delete: { type: boolean }
+        collect: { type: boolean, description: "True when the parcel can be opened/collected." }
+        highlight: { type: boolean }
+        refreshUntil: { type: string, format: date-time, nullable: true }
+        redirectionUrl: { type: string, nullable: true }
+        expandAvizo: { type: boolean }
+        requestEasyAccessZone: { type: string }
+        voicebot: { type: boolean }
+        canShareToObserve: { type: boolean }
+        canShareOpenCode: { type: boolean }
+        canShareParcel: { type: boolean }
+        withDonations: { type: boolean, nullable: true }
+
+    EventNetwork:
+      type: object
+      required: [date, eventTitle]
+      properties:
+        date: { type: string, format: date-time }
+        eventTitle: { type: string }
+        eventDescription: { type: string, nullable: true }
+        eventCode: { type: string, nullable: true }
+        location:
+          nullable: true
+          type: object
+          properties:
+            countryCode: { type: string }
+            city: { type: string, nullable: true }
+
+    InternationalCustomerNetwork:
+      type: object
+      description: >
+        Sender/receiver party. Only `name` is documented;
+        other customer/address fields may be present, hence additionalProperties.
+      additionalProperties: true
+      properties:
+        name:
+          type: string
+          nullable: true
+          description: Display name — company or person, e.g. "Amazon Polska", "SuperSound Sp. z o.o.".
+
+    EventLogNetwork:
+      type: object
+      required: [type, name, date]
+      properties:
+        type: { type: string }
+        name: { type: string }
+        date: { type: string, format: date-time }
+        details:
+          nullable: true
+          type: object
+          properties:
+            invoiceRequested: { type: boolean }
+
+    CashOnDeliveryNetwork:
+      type: object
+      properties:
+        price: { type: string, nullable: true }
+        paid: { type: boolean, nullable: true }
+        url: { type: string, nullable: true }
+        payCode: { type: string, nullable: true }
+        transactionStatus: { type: string, nullable: true }
+
+    MultiCompartmentNetwork:
+      type: object
+      required: [uuid]
+      properties:
+        uuid: { type: string }
+        shipmentNumbers: { type: array, nullable: true, items: { type: string } }
+        presentation: { type: boolean }
+        collected: { type: boolean }
+
+    AddTrackedParcelRequest:
+      type: object
+      required: [shipmentNumber, parcelType]
+      properties:
+        shipmentNumber: { type: string }
+        parcelType:
+          type: string
+          enum: [TRACKED, SENT]
+          default: TRACKED
+
+    ParcelPropertiesRequest:
+      type: object
+      required: [shipmentNumber, propertyKey]
+      properties:
+        shipmentNumber: { type: string }
+        propertyKey: { type: string }
+
+    ShareParcelsRequest:
+      type: object
+      required: [parcels]
+      properties:
+        parcels:
+          type: array
+          items:
+            type: object
+            required: [shipmentNumber, friendUuids]
+            properties:
+              shipmentNumber: { type: string }
+              friendUuids: { type: array, items: { type: string } }
+
+    # ---- compartment ----
+    CompartmentValidationRequest:
+      type: object
+      required: [parcel, geoPoint]
+      properties:
+        parcel: { $ref: '#/components/schemas/ParcelCompartmentNetwork' }
+        geoPoint: { $ref: '#/components/schemas/GeoPointNetwork' }
+
+    ParcelCompartmentNetwork:
+      type: object
+      required: [shipmentNumber, openCode]
+      properties:
+        shipmentNumber: { type: string }
+        openCode: { type: string, description: The numeric open code from the parcel. }
+        receiverPhoneNumber:
+          allOf: [{ $ref: '#/components/schemas/InternationalPhoneNumberNetwork' }]
+
+    GeoPointNetwork:
+      type: object
+      required: [latitude, longitude, accuracy]
+      description: Client-supplied device location. App requires accuracy ≤ 30 m, fix ≤ 10 s old.
+      properties:
+        latitude: { type: number, format: double }
+        longitude: { type: number, format: double }
+        accuracy: { type: number, format: float, description: Meters. }
+
+    CompartmentValidateResponse:
+      type: object
+      required: [sessionUuid, sessionExpirationTime]
+      properties:
+        sessionUuid: { type: string, description: Key for all subsequent collect calls. }
+        sessionExpirationTime: { type: integer, format: int64 }
+
+    CompartmentSessionIdRequest:
+      type: object
+      required: [sessionUuid]
+      properties:
+        sessionUuid: { type: string }
+
+    CompartmentOpenResponse:
+      type: object
+      properties:
+        compartment:
+          allOf: [{ $ref: '#/components/schemas/CompartmentNetwork' }]
+        openCompartmentWaitingTime: { type: integer, format: int64, description: Duration (ms) to wait for the door to open. }
+        actionTime: { type: integer, format: int64, description: Duration (ms) window to act once open. }
+        confirmActionTime: { type: integer, format: int64, description: Duration (ms) window to confirm close. }
+
+    CompartmentNetwork:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        location:
+          nullable: true
+          type: object
+          properties:
+            side: { type: string, nullable: true }
+            column: { type: string, nullable: true }
+            row: { type: string, nullable: true }
+
+    CompartmentStatusRequest:
+      type: object
+      required: [sessionUuid]
+      properties:
+        sessionUuid: { type: string }
+        expectedStatus:
+          type: string
+          nullable: true
+          enum: [OPENED, CLOSED]
+
+    CompartmentStatusResponse:
+      type: object
+      required: [status]
+      properties:
+        compartment:
+          allOf: [{ $ref: '#/components/schemas/CompartmentNetwork' }]
+        status:
+          type: string
+          description: >
+            Physical compartment state, polled until terminal. The client maps
+            this string 1:1 onto an enum, so an unknown value is a hard error.
+            SCHEDULED = open command accepted, door not open yet; OPENED = door
+            open; FAILED = locker failed to open; CLOSED = door shut; TIMEOUT =
+            locker did not act in its window. Poll with expectedStatus=OPENED
+            until it leaves SCHEDULED, then expectedStatus=CLOSED until CLOSED.
+          enum: [SCHEDULED, OPENED, FAILED, CLOSED, TIMEOUT]
+
+    CompartmentCloseResponse:
+      type: object
+      properties:
+        closed:
+          type: boolean
+          description: >
+            Definitive door-shut confirmation from POST /compartment/closed.
+            true = door confirmed shut (proceed to claim/finish); false = not
+            closed, prompt the user to shut the door. This boolean, not the
+            status poll, is the authoritative success flag.
+
+    CompartmentClaimRequest:
+      type: object
+      required: [sessionUuid]
+      properties:
+        sessionUuid: { type: string }
+        shipmentNumbers: { type: array, nullable: true, items: { type: string } }
+
+    CompartmentClaimResponse:
+      type: object
+      properties:
+        openCompartmentWaitingTime: { type: integer, format: int64 }
+        actionTime: { type: integer, format: int64 }
+        confirmActionTime: { type: integer, format: int64 }
+
+    # ---- points ----
+    PointsV4Network:
+      type: object
+      properties:
+        points:
+          type: array
+          nullable: true
+          items: { $ref: '#/components/schemas/PointV4Network' }
+
+    PointV4Network:
+      type: object
+      required: [pointType]
+      properties:
+        name: { type: string, nullable: true }
+        status: { type: string, nullable: true }
+        location: { $ref: '#/components/schemas/PointLocationNetwork' }
+        locationDescription: { type: string, nullable: true }
+        openingHours: { type: string, nullable: true }
+        openingHoursDetails:
+          type: array
+          nullable: true
+          items: { $ref: '#/components/schemas/OpeningHoursDetailsNetwork' }
+        addressDetails:
+          allOf: [{ $ref: '#/components/schemas/AddressDetailsNetwork' }]
+        country: { type: string, nullable: true }
+        paymentType: { type: object, nullable: true, additionalProperties: { type: string } }
+        pointType: { type: string, description: "Free-form, e.g. parcel locker / POP / POK." }
+        virtual: { type: integer }
+        location247: { type: boolean }
+        doubled: { type: boolean }
+        imageUrl: { type: string, nullable: true }
+        airSensor: { type: boolean }
+        remoteSend: { type: boolean }
+        remoteReturn: { type: boolean }
+        lockerAvailability:
+          allOf: [{ $ref: '#/components/schemas/LockerAvailabilityNetwork' }]
+        distance: { type: integer, nullable: true }
+        printInStore: { type: boolean, nullable: true }
+
+    BoxMachineNetwork:
+      type: object
+      required: [name]
+      description: >
+        Pickup point embedded on a parcel (`pickUpPoint`). Verified on live
+        /v4/parcels/tracked (2026-07): the embedded shape is richer than a bare
+        address — it also carries `openingHours`, `type`, `virtual`,
+        `easyAccessZone` and a top-level `country`, the same extras previously
+        only documented on the standalone map point (`PointV4Network`).
+      properties:
+        name: { type: string }
+        location: { $ref: '#/components/schemas/PointLocationNetwork' }
+        locationDescription: { type: string, nullable: true }
+        openingHours:
+          type: string
+          nullable: true
+          description: >
+            Free-form opening-hours string; commonly `"24/7"` for parcel lockers
+            This is the flat string form — NOT the structured
+            `OpeningHoursDetailsNetwork[]` used by the points/map endpoint.
+        addressDetails:
+          allOf: [{ $ref: '#/components/schemas/AddressDetailsNetwork' }]
+        paymentType: { type: object, nullable: true, additionalProperties: { type: string } }
+        pointType: { type: string, nullable: true, description: "Free-form classification (e.g. `PL`)." }
+        type:
+          type: array
+          nullable: true
+          items: { type: string }
+          description: "Classification tags, e.g. `[\"parcel_locker\"]`. Array, distinct from the scalar `pointType`. Verified on embedded pickUpPoint (2026-07)."
+        virtual: { type: integer, nullable: true, description: "0/1 flag (int, not bool — matches PointV4Network). Verified on embedded pickUpPoint." }
+        location247: { type: boolean }
+        easyAccessZone: { type: boolean, nullable: true, description: "Point has an easy-access zone. Distinct from the parcel-level `inEasyAccessZone`. Verified on embedded pickUpPoint (2026-07)." }
+        country: { type: string, nullable: true, description: "Point country code, e.g. `\"PL\"` — top-level on the point, distinct from `addressDetails.country`. Verified on embedded pickUpPoint (2026-07)." }
+        doubled: { type: boolean, nullable: true }
+        imageUrl: { type: string, nullable: true, description: "Photo of the point/locker." }
+        airSensor: { type: boolean }
+        remoteSend: { type: boolean, nullable: true }
+        remoteReturn: { type: boolean, nullable: true }
+        distance: { type: integer, nullable: true }
+
+    PointLocationNetwork:
+      type: object
+      nullable: true
+      properties:
+        latitude: { type: number, format: double }
+        longitude: { type: number, format: double }
+
+    AddressDetailsNetwork:
+      type: object
+      properties:
+        city: { type: string, nullable: true }
+        country: { type: string, nullable: true, description: "Kotlin field `countryCode`." }
+        province: { type: string, nullable: true }
+        postCode: { type: string, nullable: true }
+        street: { type: string, nullable: true }
+        buildingNumber: { type: string, nullable: true }
+        flatNumber: { type: string, nullable: true }
+        description: { type: string, nullable: true }
+
+    OpeningHoursDetailsNetwork:
+      type: object
+      required: [day, opening]
+      properties:
+        day: { type: string }
+        opening:
+          type: array
+          items:
+            type: object
+            properties:
+              start: { type: integer }
+              end: { type: integer }
+
+    LockerAvailabilityNetwork:
+      type: object
+      properties:
+        status: { type: string, nullable: true }
+        details:
+          nullable: true
+          type: object
+          properties:
+            sizeA: { type: string, nullable: true }
+            sizeB: { type: string, nullable: true }
+            sizeC: { type: string, nullable: true }
+            sizeD: { type: string, nullable: true }
